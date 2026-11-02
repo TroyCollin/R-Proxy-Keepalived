@@ -1,211 +1,487 @@
-### High-Availability Nginx Reverse Proxy with Keepalived on Docker
+# High-Availability Nginx Reverse Proxy with Keepalived
 
-This repository contains the configuration files to deploy a highly available, load-balanced Nginx Reverse Proxy infrastructure across two independent Docker nodes. High availability is achieved using Virtual Router Redundancy Protocol (VRRP) via Keepalived, allowing a shared Virtual IP (VIP) to failover instantly if the primary node goes offline. 
+[![Docker](https://img.shields.io/badge/Docker-Compose-blue?logo=docker)](https://www.docker.com/)
+[![Nginx](https://img.shields.io/badge/Nginx-Reverse%20Proxy-green?logo=nginx)](https://nginx.org/)
+[![Keepalived](https://img.shields.io/badge/Keepalived-VRRP-orange)](https://www.keepalived.org/)
 
-### Architecture Overview
+A highly available Nginx reverse proxy infrastructure running across two independent Linux servers using Docker Compose and Keepalived.
 
-* **Virtual IP (VIP):** 192.168.5.62 (Point your DNS/Domains here)
-* **Node 1 (Primary MASTER):** 192.168.1.11 (Priority: 101)
-* **Node 2 (Secondary BACKUP):** 192.168.1.12 (Priority: 100)
-* **Host Network Adapter:** ens18 (Adjust based on your environment)
+The solution uses the Virtual Router Redundancy Protocol (VRRP) to maintain a shared Virtual IP (VIP). If the primary node becomes unavailable, the secondary node takes ownership of the VIP, allowing incoming traffic to continue through the backup server.
 
-### Prerequisites
+The goal is to eliminate a single point of failure at the reverse proxy layer.
 
-Before starting the containers, you must run the following commands on **BOTH Node 1 and Node 2**. 
+---
 
-By default, Linux prevents services from binding to an IP address that does not explicitly belong to the local system. Because only one node holds the Virtual IP at any given time, the backup node's Nginx service will fail to start without enabling non-local binding. 
+## Table of Contents
 
-bash
+- [Architecture Overview](#architecture-overview)
+- [Network Configuration](#network-configuration)
+- [Repository Structure](#repository-structure)
+- [How It Works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
+- [Verification](#verification)
+- [Failover Testing](#failover-testing)
+- [Troubleshooting](#troubleshooting)
+- [Security Considerations](#security-considerations)
 
-# Temporarily enable non-local IP binding
-sudo sysctl -w net.ipv4.ip_nonlocal_bind=1
+---
 
-# Make the setting permanent across system reboots
-echo "net.ipv4.ip_nonlocal_bind=1" | sudo tee -a /etc/sysctl.conf
+## Architecture Overview
 
-Use code with caution.
+The infrastructure consists of two independent Docker hosts running identical Nginx reverse proxy services.
 
-### Repository Structure
+Keepalived manages the shared Virtual IP and determines which node is currently responsible for handling incoming traffic.
 
-text
+### Network Architecture
 
-├── node-1/
+```mermaid
+flowchart TD
+    CLIENT["Clients / Applications"]
+    VIP["Virtual IP<br/>192.168.5.62"]
+
+    CLIENT --> VIP
+
+    VIP --> NODE1
+    VIP -. Failover .-> NODE2
+
+    subgraph NODE1["Node 1 - Primary"]
+        K1["Keepalived<br/>MASTER / Priority 101"]
+        N1["Nginx Container"]
+        K1 --> N1
+    end
+
+    subgraph NODE2["Node 2 - Secondary"]
+        K2["Keepalived<br/>BACKUP / Priority 100"]
+        N2["Nginx Container"]
+        K2 --> N2
+    end
+
+    K1 <-->|"VRRP Unicast"| K2
+```
+
+### Node Responsibilities
+
+| Component | Node 1 | Node 2 |
+|---|---|---|
+| Role | Primary | Secondary |
+| Host IP | 192.168.5.45 | 192.168.5.40 |
+| Virtual IP | 192.168.5.62 | 192.168.5.62 |
+| Keepalived State | MASTER | BACKUP |
+| VRRP Priority | 101 | 100 |
+| Nginx | Active | Active |
+
+Both Nginx containers remain running. Keepalived controls which host owns the VIP.
+
+---
+
+## Network Configuration
+
+The following values reflect the current example configuration.
+
+| Setting | Value |
+|---|---|
+| Node 1 IP | `192.168.5.45` |
+| Node 2 IP | `192.168.5.40` |
+| Virtual IP | `192.168.5.62/24` |
+| Network Interface | `eno1` |
+| VRRP Instance | `VI_1` |
+| VRRP Router ID | `51` |
+| VRRP Advertisement Interval | 1 second |
+| Node 1 Priority | 101 |
+| Node 2 Priority | 100 |
+
+**Important:** Both nodes must use the same `virtual_router_id`, authentication configuration, and VIP.
+
+The network interface name must also match the actual interface on each Linux host. Change `eno1` if your environment uses something different, such as `ens18`.
+
+---
+
+## Repository Structure
+
+```text
+R-Proxy-Keepalived/
+│
+├── Node1/
 │   ├── docker-compose.yml
 │   ├── keepalived.conf
-│   └── nginx.conf
-└── node-2/
-    ├── docker-compose.yml
-    ├── keepalived.conf
-    └── nginx.conf
+│   ├── nginx.conf
+│   └── certs/
+│
+├── Node2/
+│   ├── docker-compose.yml
+│   ├── keepalived.conf
+│   ├── nginx.conf
+│   └── certs/
+│
+└── README.md
+```
 
-Use code with caution.
+The `certs` directories are mounted into the Nginx containers for certificate storage. HTTPS configuration still needs to be added to Nginx before those certificates are used.
 
-### Configuration Files
+---
 
-### 📂 Node 1 (MASTER)
+## How It Works
 
-#### 1. keepalived.conf
+### 1. Nginx Reverse Proxy
 
-ini
+Each node runs an independent Nginx container.
 
-global_defs {
-    script_user root
+Nginx listens on port 80 and handles incoming HTTP requests.
+
+The current example returns a simple response identifying the hostname handling the request.
+
+### 2. Keepalived and VRRP
+
+Keepalived monitors the availability of its peer using VRRP unicast advertisements.
+
+Node 1 starts with MASTER status and has a higher priority.
+
+Node 2 starts as BACKUP and monitors Node 1.
+
+If Node 1 becomes unavailable, Node 2 takes ownership of the Virtual IP.
+
+### 3. Virtual IP Failover
+
+The VIP is the single entry point for clients.
+
+Applications and DNS records should reference the VIP rather than either individual node address.
+
+This allows the infrastructure to move traffic between nodes without requiring changes to client configurations.
+
+---
+
+## Prerequisites
+
+Both Linux hosts require:
+
+- Linux operating system with Docker support.
+- Docker Engine.
+- Docker Compose plugin.
+- Network connectivity between both nodes.
+- Static IP addresses.
+- Root or equivalent administrative privileges.
+- Firewall rules permitting required traffic.
+
+### Required Network Access
+
+| Protocol | Port | Purpose |
+|---|---:|---|
+| TCP | 80 | HTTP |
+| TCP | 443 | HTTPS (when configured) |
+| IP Protocol 112 | N/A | VRRP communication |
+
+For unicast VRRP, permit protocol 112 between the two node addresses.
+
+---
+
+## Configuration
+
+### Docker Compose
+
+Both nodes use the same basic Docker Compose configuration.
+
+The stack consists of two services:
+
+- `nginx-proxy`: Nginx reverse proxy.
+- `keepalived`: VRRP management and VIP failover.
+
+The Keepalived container uses host networking because it needs access to the host network interface.
+
+It also requires network administration capabilities to manage the VIP.
+
+### Keepalived Configuration
+
+Node 1 is configured as the primary node.
+
+Node 2 is configured as the secondary node.
+
+The following settings must be adjusted for your environment:
+
+```conf
+interface eno1
+virtual_router_id 51
+unicast_src_ip <LOCAL_NODE_IP>
+
+unicast_peer {
+    <PEER_NODE_IP>
 }
 
-vrrp_script check_nginx {
-    script "/usr/bin/killall -0 nginx"
-    interval 2
-    weight 2
+virtual_ipaddress {
+    192.168.5.62/24 dev eno1
 }
+```
 
-vrrp_instance VI_1 {
-    state MASTER
-    interface ens18
-    virtual_router_id 51
-    priority 101
-    advert_int 1
+Node 1 should use:
 
-    unicast_src_ip 192.168.1.11
-    unicast_peer {
-        192.168.1.12
-    }
+- State: MASTER
+- Priority: 101
+- Local IP: 192.168.5.45
+- Peer IP: 192.168.5.40
 
-    authentication {
-        auth_type PASS
-        auth_pass SecretN8
-    }
+Node 2 should use:
 
-    virtual_ipaddress {
-        192.168.5.62/24 dev ens18
-    }
+- State: BACKUP
+- Priority: 100
+- Local IP: 192.168.5.40
+- Peer IP: 192.168.5.45
 
-    track_script {
-        check_nginx
-    }
-}
+**Health checking:** The existing `killall` health-check script should be replaced with a check that verifies Nginx through its published HTTP endpoint. The Keepalived and Nginx containers have separate process namespaces, so the current process check cannot reliably monitor Nginx.
 
-Use code with caution.
+---
 
-#### 2. docker-compose.yml
+## Deployment
 
-yaml
+### Step 1 - Clone the Repository
 
-services:
-  nginx-proxy:
-    image: nginx:alpine
-    container_name: nginx-proxy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+On both Linux hosts:
 
-  keepalived:
-    image: osixia/keepalived:2.0.20
-    container_name: keepalived
-    restart: unless-stopped
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    volumes:
-      - ./keepalived.conf:/usr/local/etc/keepalived/keepalived.conf:ro
+```bash
+git clone https://github.com/TroyCollin/R-Proxy-Keepalived.git
 
-Use code with caution.
+cd R-Proxy-Keepalived
+```
 
-### 📂 Node 2 (BACKUP)
+### Step 2 - Configure Node 1
 
-#### 1. keepalived.conf
+On the primary server:
 
-ini
+```bash
+cd Node1
+```
 
-global_defs {
-    script_user root
-}
+Verify the following settings:
 
-vrrp_script check_nginx {
-    script "/usr/bin/killall -0 nginx"
-    interval 2
-    weight 2
-}
+- Host interface.
+- Local IP address.
+- Peer IP address.
+- Virtual IP.
+- VRRP Router ID.
+- Authentication configuration.
 
-vrrp_instance VI_1 {
-    state BACKUP
-    interface ens18
-    virtual_router_id 51
-    priority 100
-    advert_int 1
+### Step 3 - Configure Node 2
 
-    unicast_src_ip 192.168.1.12
-    unicast_peer {
-        192.168.1.11
-    }
+On the secondary server:
 
-    authentication {
-        auth_type PASS
-        auth_pass SecretN8
-    }
+```bash
+cd ../Node2
+```
 
-    virtual_ipaddress {
-        192.168.5.62/24 dev ens18
-    }
+Verify that the configuration reflects the secondary node's network information.
 
-    track_script {
-        check_nginx
-    }
-}
+Both nodes must use the same VRRP Router ID.
 
-Use code with caution.
+### Step 4 - Start the Docker Services
 
-*Note: The docker-compose.yml and nginx.conf files for Node 2 are structurally identical to Node 1.* 
+On Node 1:
 
-### Deployment Steps
-
-1. Clone or copy the respective files to Node 1 and Node 2.
-2. Navigate to your project folder on **Node 1** and start the stack: 
-
-bash
-
+```bash
+cd Node1
 docker compose up -d
+```
 
-Use code with caution.
-3. Navigate to your project folder on **Node 2** and start the stack: 
+On Node 2:
 
-bash
-
+```bash
+cd Node2
 docker compose up -d
+```
 
-Use code with caution.
+### Step 5 - Verify Containers
 
-### Verification & Testing Failover
+Run on both servers:
 
-### 1. Verify VIP Allocation
+```bash
+docker compose ps
+```
 
-Run the following command on **Node 1**: 
+Review the logs:
 
-bash
+```bash
+docker logs nginx-proxy
 
-ip addr show ens18
+docker logs keepalived
+```
 
-Use code with caution.
+---
 
-You should see the Virtual IP 192.168.5.62 attached to the interface. Running the same command on Node 2 should show that Node 2 does not yet hold the IP. 
+## Verification
 
-### 2. Run Failover Test
+### Verify VIP Ownership
 
-1. From a separate machine on the network, ping the Virtual IP continuously: 
+Run the following command on both servers:
 
-bash
+```bash
+ip addr show eno1
+```
 
+Under normal operation, the VIP should appear on Node 1 only.
+
+Node 2 should not have the VIP while Node 1 is operating as MASTER.
+
+### Test Nginx
+
+From another machine:
+
+```bash
+curl http://192.168.5.62
+```
+
+Expected response:
+
+```text
+HA Cluster Active! Responding from hostname: <hostname>
+```
+
+The hostname identifies which Nginx container handled the request.
+
+### Monitor Keepalived
+
+Check the logs:
+
+```bash
+docker logs -f keepalived
+```
+
+Look for MASTER and BACKUP state transitions.
+
+---
+
+## Failover Testing
+
+Failover testing is important to ensure that the infrastructure behaves as expected when a node becomes unavailable.
+
+### Test 1 - Primary Node Failure
+
+From another machine, continuously ping the VIP:
+
+```bash
+ping 192.168.5.62
+```
+
+On Node 1, stop the Docker stack:
+
+```bash
+cd Node1
+docker compose down
+```
+
+Expected behavior:
+
+1. Node 1 stops advertising its VRRP MASTER state.
+2. Node 2 detects the loss of the primary node.
+3. Node 2 transitions to MASTER.
+4. Node 2 acquires the Virtual IP.
+5. Incoming traffic resumes through Node 2.
+
+Verify VIP ownership on Node 2:
+
+```bash
+ip addr show eno1
+```
+
+Test the reverse proxy:
+
+```bash
+curl http://192.168.5.62
+```
+
+### Test 2 - Primary Node Recovery
+
+Restart the services on Node 1:
+
+```bash
+cd Node1
+docker compose up -d
+```
+
+With the default preemption behavior and the higher priority, Node 1 should reclaim MASTER status once it is healthy.
+
+Verify the VIP has returned to Node 1.
+
+### Test 3 - Nginx Service Failure
+
+Stop only the Nginx container on Node 1:
+
+```bash
+docker stop nginx-proxy
+```
+
+Verify that the configured Keepalived health check detects the failure and triggers the expected transition.
+
+This test should only be considered successful after the health-check implementation has been corrected.
+
+---
+
+## Troubleshooting
+
+| Problem | Possible Cause | Suggested Check |
+|---|---|---|
+| VIP does not appear | VRRP configuration mismatch | Compare both keepalived.conf files |
+| Both nodes claim VIP | VRRP communication failure | Check protocol 112 and router IDs |
+| VIP stays on failed node | Health check not working | Review Keepalived logs |
+| Nginx unavailable | Container not running | Check `docker compose ps` |
+| HTTP connection refused | Port publishing or firewall issue | Check ports 80 and 443 |
+| HTTPS unavailable | TLS listener not configured | Review nginx.conf |
+| Failover does not occur | Peer communication issue | Check unicast peer IPs |
+
+Useful diagnostic commands:
+
+```bash
+# Show interface configuration
+ip addr show
+
+# Check Docker containers
+docker ps -a
+
+# Check Keepalived logs
+docker logs keepalived
+
+# Check Nginx logs
+docker logs nginx-proxy
+
+# Test VIP connectivity
 ping 192.168.5.62
 
-Use code with caution.
-2. Intentionally stop the Docker stack or simulate a crash on **Node 1**: 
+# Test HTTP response
+curl -v http://192.168.5.62
+```
 
-bash
+---
 
-docker compose down
+## Security Considerations
 
-Use code with caution.
-3. Observe the ping stream. You will see near-zero packet loss. Keepalived on Node 2 will immediately recognize the Master's absence, claim the VIP, and route incoming web traffic seamlessly.
+Before using this solution in production:
+
+- Replace the example VRRP authentication password.
+- Do not commit production passwords or secrets to Git.
+- Restrict VRRP traffic to the two participating nodes.
+- Restrict management access to trusted administrators.
+- Configure TLS certificates and HTTPS listeners before exposing port 443.
+- Keep Docker images and the underlying operating system patched.
+- Review container capabilities and privileges.
+- Implement a reliable Nginx health-check mechanism.
+
+VRRP password authentication should not be treated as a strong security boundary.
+
+---
+
+## Project Goals
+
+This project demonstrates a practical approach to improving reverse proxy availability using:
+
+- Docker containerization.
+- Nginx reverse proxy services.
+- Keepalived VRRP failover.
+- Shared Virtual IP addressing.
+- Automated primary/secondary node transitions.
+- Infrastructure resilience and service continuity.
+
+The architecture can be extended to support multiple backend applications, SSL termination, monitoring, and additional reverse proxy configurations.
+
+---
+
+**Repository:** [R-Proxy-Keepalived](https://github.com/TroyCollin/R-Proxy-Keepalived)
+
+
